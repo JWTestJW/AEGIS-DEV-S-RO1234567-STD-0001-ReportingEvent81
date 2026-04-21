@@ -1,0 +1,245 @@
+# ================================================
+# 機能概要
+# -----------------------------------------------
+# このワークフローは、GitHub Events API から 3つのソースのイベントログを
+# 収集し、マージして 1つのテキストファイルに出力します。
+#
+# 実行条件：
+# ・手動実行（workflow_dispatch）のみ
+#
+# 主な処理：
+# ・組織全体のイベント (GET /orgs/{org}/events)
+# ・現在のユーザーのイベント (GET /users/{username}/events)
+# ・現在のリポジトリのイベント (GET /repos/{owner}/{repo}/events)
+# ・各 API が失敗した場合は警告を出力し、次の API を実行
+# ・マージされたログを event_log_digest.txt ファイルとして保存
+# ・統計情報とプレビューを GitHub Actions Summary に表示
+# ================================================
+
+name: Export Event Logs Digest
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  export-event-logs:
+    name: Export and merge logs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Collect and format event logs
+        id: collect
+        uses: actions/github-script@v8
+        env:
+          ORG_NAME: ${{ github.repository_owner }}
+          REPO_FULL_NAME: ${{ github.repository }}
+          ACTOR_NAME: ${{ github.actor }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require("fs");
+
+            const apiHeaders = {
+              Accept: "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2026-03-10"
+            };
+
+            const org = process.env.ORG_NAME;
+            const repoFullName = process.env.REPO_FULL_NAME;
+            const actorName = process.env.ACTOR_NAME;
+
+            function asIsoTime(value) {
+              if (!value) {
+                return "unknown-time";
+              }
+              const date = new Date(value);
+              if (Number.isNaN(date.getTime())) {
+                return String(value);
+              }
+              return date.toISOString();
+            }
+
+            function formatLine(time, id, title) {
+              return `${time} | ${id} | ${title}`;
+            }
+
+            function toErrorMessage(error) {
+              if (!error) {
+                return "unknown error";
+              }
+              if (error.message) {
+                return error.message;
+              }
+              return String(error);
+            }
+
+            async function fetchPaginatedArray(route, requestParams, sourceName) {
+              const items = [];
+              let page = 1;
+
+              while (true) {
+                const perPage = 100;
+                try {
+                  const response = await github.request(route, {
+                    ...requestParams,
+                    per_page: perPage,
+                    page,
+                    headers: apiHeaders
+                  });
+
+                  const chunk = Array.isArray(response.data) ? response.data : [];
+                  items.push(...chunk);
+
+                  if (chunk.length < perPage) {
+                    break;
+                  }
+
+                  page += 1;
+                } catch (error) {
+                  const status = error && typeof error.status === "number" ? error.status : null;
+                  const message = toErrorMessage(error);
+                  throw new Error(`Status: ${status || "unknown"}, Message: ${message}`);
+                }
+              }
+
+              core.info(`✅ ${sourceName}: fetched ${items.length} logs.`);
+              return items;
+            }
+
+            async function collectSource(sourceName, collector, counts, allLines) {
+              try {
+                const lines = await collector();
+                counts[sourceName] = lines.length;
+                allLines.push(...lines.map((line) => `[${sourceName}] ${line}`));
+              } catch (error) {
+                const status = error && typeof error.status === "number" ? error.status : null;
+                const message = toErrorMessage(error);
+
+                core.warning(`⚠️ ${sourceName}: failed to fetch logs. Status: ${status || "unknown"}, Message: ${message}`);
+
+                counts[sourceName] = 0;
+              }
+            }
+
+            const counts = {
+              ORG: 0,
+              USER: 0,
+              REPO: 0
+            };
+            const mergedLines = [];
+
+            await collectSource(
+              "ORG",
+              async () => {
+                const orgEvents = await fetchPaginatedArray(
+                  "GET /orgs/{org}/events",
+                  { org },
+                  "ORG"
+                );
+
+                return orgEvents.map((entry) => {
+                  const time = asIsoTime(entry.created_at || entry.timestamp);
+                  const actor = entry.actor && entry.actor.login ? entry.actor.login : "unknown-user";
+                  const eventType = entry.type || "UnknownEvent";
+                  const payloadAction = entry.payload && entry.payload.action ? `:${entry.payload.action}` : "";
+                  const targetRepo = entry.repo && entry.repo.name ? ` on ${entry.repo.name}` : "";
+                  const title = `${actor} ${eventType}${payloadAction}${targetRepo}`;
+                  const id = entry.id || `${time}:${actor}:${eventType}`;
+                  return formatLine(time, id, title);
+                });
+              },
+              counts,
+              mergedLines
+            );
+
+            await collectSource(
+              "USER",
+              async () => {
+                const userEvents = await fetchPaginatedArray(
+                  "GET /users/{username}/events",
+                  { username: actorName },
+                  "USER"
+                );
+
+                return userEvents.map((entry) => {
+                  const time = asIsoTime(entry.created_at || entry.timestamp);
+                  const actor = entry.actor && entry.actor.login ? entry.actor.login : actorName;
+                  const eventType = entry.type || "UnknownEvent";
+                  const payloadAction = entry.payload && entry.payload.action ? `:${entry.payload.action}` : "";
+                  const targetRepo = entry.repo && entry.repo.name ? ` on ${entry.repo.name}` : "";
+                  const title = `${actor} ${eventType}${payloadAction}${targetRepo}`;
+                  const id = entry.id || `${time}:${actor}:${eventType}`;
+                  return formatLine(time, id, title);
+                });
+              },
+              counts,
+              mergedLines
+            );
+
+            await collectSource(
+              "REPO",
+              async () => {
+                const [owner, repo] = repoFullName.split("/");
+                const repoEvents = await fetchPaginatedArray(
+                  "GET /repos/{owner}/{repo}/events",
+                  { owner, repo },
+                  "REPO"
+                );
+
+                return repoEvents.map((entry) => {
+                  const time = asIsoTime(entry.created_at || entry.timestamp);
+                  const actor = entry.actor && entry.actor.login ? entry.actor.login : "unknown-user";
+                  const eventType = entry.type || "UnknownEvent";
+                  const payloadAction = entry.payload && entry.payload.action ? `:${entry.payload.action}` : "";
+                  const targetRepo = entry.repo && entry.repo.name ? ` on ${entry.repo.name}` : "";
+                  const title = `${actor} ${eventType}${payloadAction}${targetRepo}`;
+                  const id = entry.id || `${time}:${actor}:${eventType}`;
+                  return formatLine(time, id, title);
+                });
+              },
+              counts,
+              mergedLines
+            );
+
+            const mergedLogString = mergedLines.join("\n");
+
+            // Generate filename with timestamp (YYYYMMDD_HHMMSS)
+            const now = new Date();
+            const year = now.getFullYear();
+            const month = String(now.getMonth() + 1).padStart(2, "0");
+            const day = String(now.getDate()).padStart(2, "0");
+            const hours = String(now.getHours()).padStart(2, "0");
+            const minutes = String(now.getMinutes()).padStart(2, "0");
+            const seconds = String(now.getSeconds()).padStart(2, "0");
+            const timestamp = `${year}${month}${day}_${hours}${minutes}${seconds}`;
+            const outputFileName = `event_log_digest_${timestamp}.txt`;
+
+            core.setOutput("org_count", String(counts.ORG));
+            core.setOutput("user_count", String(counts.USER));
+            core.setOutput("repo_count", String(counts.REPO));
+            core.setOutput("total_count", String(mergedLines.length));
+
+            fs.writeFileSync(outputFileName, `${mergedLogString}\n`, { encoding: "utf8" });
+
+            core.info(`✅ Merged ${mergedLines.length} logs into a single string.`);
+            core.info(`✅ Digest file created: ${outputFileName}`);
+
+            const preview = mergedLines.length > 200 ? mergedLines.slice(0, 200) : mergedLines;
+            await core.summary
+              .addHeading("Event Log Digest")
+              .addRaw(`- ORG logs: ${counts.ORG}\n`)
+              .addRaw(`- USER logs: ${counts.USER}\n`)
+              .addRaw(`- REPO logs: ${counts.REPO}\n`)
+              .addRaw(`- TOTAL logs: ${mergedLines.length}\n\n`)
+              .addCodeBlock(preview.join("\n") || "(empty)", "text")
+              .write();
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: event-log-digest-${{ github.run_id }}
+          path: event_log_digest_*.txt
+          if-no-files-found: error
